@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 st.set_page_config(page_title="BTC Forecast Lab", page_icon="₿", layout="wide")
 st.title("₿ BTC Forecast Lab")
-st.caption("Research dashboard • public market data • paper trading only • no accuracy claims before validation")
+st.caption("Walk-forward research • public market data • paper trading only • no live orders")
 
 HORIZONS = {
     "15 minutes": {"timeframe": "1m", "bars": 15},
@@ -19,16 +19,18 @@ HORIZONS = {
     "24 hours": {"timeframe": "15m", "bars": 96},
     "7 days": {"timeframe": "1h", "bars": 168},
 }
-TIMEFRAME_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000}
 
 with st.sidebar:
     st.header("Configuration")
-    exchange_id = st.selectbox("Exchange", ["binance", "coinbase", "kraken"], index=0)
-    symbol = st.text_input("Market symbol", "BTC/USDT" if exchange_id == "binance" else "BTC/USD")
+    exchange_id = st.selectbox("Exchange", ["kraken", "coinbase", "binance"], index=0)
+    default_symbol = "BTC/USD" if exchange_id in ("kraken", "coinbase") else "BTC/USDT"
+    symbol = st.text_input("Market symbol", default_symbol)
     candle_limit = st.slider("Candles per horizon", 300, 1000, 1000, 100)
     fee_bps = st.number_input("Trading fee (basis points, each side)", min_value=0.0, max_value=100.0, value=10.0, step=1.0)
     slippage_bps = st.number_input("Slippage estimate (basis points, each side)", min_value=0.0, max_value=100.0, value=5.0, step=1.0)
-    st.caption("Costs are assumptions; replace them with your venue's actual fees and observed execution slippage.")
+    min_train = st.slider("Minimum training rows", min_value=200, max_value=600, value=300, step=50)
+    folds = st.slider("Walk-forward test folds", min_value=2, max_value=5, value=3)
+    st.caption("Costs are assumptions. Set them to realistic venue fees and slippage.")
     refresh = st.button("Fetch market data & evaluate", type="primary")
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -37,21 +39,25 @@ def fetch_ohlcv(exchange_name, market_symbol, timeframe, limit):
     ex = ex_class({"enableRateLimit": True, "timeout": 20000})
     if not ex.has.get("fetchOHLCV"):
         raise RuntimeError(f"{exchange_name} does not support OHLCV through CCXT.")
+    markets = ex.load_markets()
+    if market_symbol not in markets:
+        suggestions = [s for s in markets if s.startswith("BTC/")][:8]
+        raise ValueError(f"Market '{market_symbol}' is not listed on {exchange_name}. Example BTC markets: {suggestions}")
     raw = ex.fetch_ohlcv(market_symbol, timeframe=timeframe, limit=limit)
     if not raw:
         raise RuntimeError("Exchange returned no candles.")
     df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df = df.drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
-    # Exclude the current candle because it may be incomplete.
+    # Exclude the newest potentially incomplete candle.
     if len(df) > 1:
         df = df.iloc[:-1].copy()
     return df
 
 def make_features(df):
-    x = pd.DataFrame(index=df.index)
     close = df["close"].astype(float)
     ret = close.pct_change()
+    x = pd.DataFrame(index=df.index)
     x["ret_1"] = ret
     x["ret_3"] = close.pct_change(3)
     x["ret_6"] = close.pct_change(6)
@@ -61,8 +67,8 @@ def make_features(df):
     x["volume_change"] = df["volume"].pct_change().replace([np.inf, -np.inf], np.nan)
     ema_fast = close.ewm(span=12, adjust=False).mean()
     ema_slow = close.ewm(span=26, adjust=False).mean()
-    x["ema_gap"] = (ema_fast / ema_slow) - 1
-    x["sma_gap"] = (close / close.rolling(20).mean()) - 1
+    x["ema_gap"] = ema_fast / ema_slow - 1
+    x["sma_gap"] = close / close.rolling(20).mean() - 1
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
@@ -70,90 +76,165 @@ def make_features(df):
     x["rsi_14"] = (100 - 100 / (1 + rs)) / 100
     return x.replace([np.inf, -np.inf], np.nan)
 
-def evaluate_and_forecast(df, horizon_bars):
-    features = make_features(df)
-    future_return = df["close"].shift(-horizon_bars) / df["close"] - 1
-    labels = (future_return > 0).astype(int)
-    valid = features.notna().all(axis=1) & future_return.notna()
-    X = features.loc[valid]
-    y = labels.loc[valid]
-    if len(X) < 180 or y.nunique() < 2:
-        raise ValueError(f"Not enough usable history/class diversity ({len(X)} labelled rows). Fetch more data or use a shorter horizon.")
-    split = int(len(X) * 0.8)
-    if split < 100 or len(X) - split < 30:
-        raise ValueError("Insufficient rows for a meaningful chronological holdout.")
-    X_train, X_test = X.iloc[:split], X.iloc[split:]
-    y_train, y_test = y.iloc[:split], y.iloc[split:]
-    model = Pipeline([
+def new_model():
+    return Pipeline([
         ("scale", StandardScaler()),
         ("logistic", LogisticRegression(max_iter=2000, class_weight="balanced", random_state=42))
     ])
-    model.fit(X_train, y_train)
-    p_test = model.predict_proba(X_test)[:, 1]
-    pred_test = (p_test >= 0.5).astype(int)
-    metrics = {
-        "test_rows": len(X_test),
-        "accuracy": accuracy_score(y_test, pred_test),
-        "balanced_accuracy": balanced_accuracy_score(y_test, pred_test),
-        "brier": brier_score_loss(y_test, p_test),
-        "base_rate": float(y_test.mean()),
-        "test_start": str(df.loc[X_test.index[0], "timestamp"]),
-        "test_end": str(df.loc[X_test.index[-1], "timestamp"]),
+
+def max_drawdown(returns):
+    if len(returns) == 0:
+        return np.nan
+    equity = np.cumprod(1 + np.asarray(returns, dtype=float))
+    peaks = np.maximum.accumulate(np.r_[1.0, equity])[1:]
+    dd = equity / peaks - 1
+    return float(np.min(dd)) if len(dd) else 0.0
+
+def walk_forward_validate(df, horizon, fee_bps, slippage_bps, min_train=300, n_folds=3):
+    """Expanding-window folds. Purge horizon rows before each test fold."""
+    feats = make_features(df)
+    future_ret = df["close"].shift(-horizon) / df["close"] - 1
+    labels = (future_ret > 0).astype(int)
+    valid = feats.notna().all(axis=1) & future_ret.notna() & np.isfinite(future_ret)
+    # Preserve original row numbers so purge is measured in candle rows.
+    rows = np.flatnonzero(valid.to_numpy())
+    X = feats.loc[valid].reset_index(drop=True)
+    y = labels.loc[valid].reset_index(drop=True)
+    fr = future_ret.loc[valid].reset_index(drop=True)
+    if len(X) < min_train + horizon + 40:
+        raise ValueError(f"Not enough usable rows for walk-forward testing: {len(X)} usable; need about {min_train + horizon + 40}. Increase candles or lower minimum training rows.")
+    # Split the post-minimum sample into chronological test blocks.
+    remaining = len(X) - min_train
+    block = max(20, remaining // n_folds)
+    preds = []
+    fold_id = 0
+    test_start = min_train
+    cost = 2 * (fee_bps + slippage_bps) / 10000.0
+    while test_start < len(X) and fold_id < n_folds:
+        test_end = len(X) if fold_id == n_folds - 1 else min(len(X), test_start + block)
+        # The test boundary is in valid-row coordinates; use original candle row indices for purge.
+        first_test_original_row = rows[test_start]
+        train_mask = rows < (first_test_original_row - horizon)
+        train_positions = np.flatnonzero(train_mask)
+        if len(train_positions) < 100 or y.iloc[train_positions].nunique() < 2:
+            test_start = test_end
+            fold_id += 1
+            continue
+        model = new_model()
+        model.fit(X.iloc[train_positions], y.iloc[train_positions])
+        p = model.predict_proba(X.iloc[test_start:test_end])[:, 1]
+        for j, prob in enumerate(p, start=test_start):
+            preds.append({
+                "position": int(j),
+                "row": int(rows[j]),
+                "timestamp": df.loc[rows[j], "timestamp"],
+                "prob_up": float(prob),
+                "actual_up": int(y.iloc[j]),
+                "future_return": float(fr.iloc[j]),
+                "fold": fold_id + 1,
+                "train_up_rate": float(y.iloc[train_positions].mean())
+            })
+        test_start = test_end
+        fold_id += 1
+    out = pd.DataFrame(preds)
+    if out.empty or out["actual_up"].nunique() < 2:
+        raise ValueError("Walk-forward folds produced too few predictions or only one class. Increase candle history.")
+    out["model_pred"] = (out["prob_up"] >= 0.5).astype(int)
+    out["majority_baseline_pred"] = (out["train_up_rate"] >= 0.5).astype(int)
+    out["baseline_prob"] = out["train_up_rate"].clip(0, 1)
+    out["model_brier_component"] = (out["prob_up"] - out["actual_up"]) ** 2
+    out["baseline_brier_component"] = (out["baseline_prob"] - out["actual_up"]) ** 2
+    # Signals use fixed thresholds, and every trade pays estimated round-trip costs.
+    out["side"] = np.where(out["prob_up"] >= 0.58, 1, np.where(out["prob_up"] <= 0.42, -1, 0))
+    out["net_return"] = np.where(out["side"] != 0, out["side"] * out["future_return"] - cost, 0.0)
+    # Avoid overlapping trades: take a signal only after the prior horizon has elapsed.
+    selected = []
+    next_allowed_row = -1
+    for ix, row in out.sort_values("row").iterrows():
+        if int(row["side"]) != 0 and int(row["row"]) >= next_allowed_row:
+            selected.append(ix)
+            next_allowed_row = int(row["row"]) + horizon
+    trades = out.loc[selected].copy()
+    model_acc = accuracy_score(out["actual_up"], out["model_pred"])
+    baseline_acc = accuracy_score(out["actual_up"], out["majority_baseline_pred"])
+    model_bal = balanced_accuracy_score(out["actual_up"], out["model_pred"])
+    baseline_bal = balanced_accuracy_score(out["actual_up"], out["majority_baseline_pred"])
+    summary = {
+        "predictions": int(len(out)),
+        "folds_used": int(out["fold"].nunique()),
+        "model_accuracy": float(model_acc),
+        "majority_accuracy": float(baseline_acc),
+        "model_balanced_accuracy": float(model_bal),
+        "majority_balanced_accuracy": float(baseline_bal),
+        "model_brier": float(brier_score_loss(out["actual_up"], out["prob_up"])),
+        "historical_rate_brier": float(out["baseline_brier_component"].mean()),
+        "test_up_rate": float(out["actual_up"].mean()),
+        "trades": int(len(trades)),
+        "win_rate": float((trades["net_return"] > 0).mean()) if len(trades) else np.nan,
+        "net_compounded_return": float((1 + trades["net_return"]).prod() - 1) if len(trades) else 0.0,
+        "net_mean_trade_return": float(trades["net_return"].mean()) if len(trades) else np.nan,
+        "max_drawdown": max_drawdown(trades["net_return"]) if len(trades) else np.nan,
+        "fee_bps_each_side": float(fee_bps),
+        "slippage_bps_each_side": float(slippage_bps),
+        "cost_round_trip_pct": cost * 100,
+        "test_start": str(out["timestamp"].min()),
+        "test_end": str(out["timestamp"].max()),
     }
-    # Refit on all currently label-available rows for the latest forecast.
-    model.fit(X, y)
+    return summary, out, trades
+
+def evaluate_and_forecast(df, horizon_bars, fee_bps, slippage_bps, min_train, folds):
+    features = make_features(df)
+    future_return = df["close"].shift(-horizon_bars) / df["close"] - 1
+    labels = (future_return > 0).astype(int)
+    valid = features.notna().all(axis=1) & future_return.notna() & np.isfinite(future_return)
+    X = features.loc[valid]
+    y = labels.loc[valid]
+    if len(X) < max(180, min_train + horizon_bars + 40) or y.nunique() < 2:
+        raise ValueError(f"Not enough usable labelled rows ({len(X)}). Increase candle history or lower minimum training rows.")
     latest_features = features.iloc[[-1]]
     if latest_features.isna().any(axis=None):
-        raise ValueError("Latest candle does not have enough indicator history.")
-    probability_up = float(model.predict_proba(latest_features)[0, 1])
-    last_close = float(df["close"].iloc[-1])
-    return probability_up, last_close, metrics, X, y, model, features
-
-def paper_signal(prob_up, fee_bps, slippage_bps):
-    # A conservative deadband accounts for round-trip costs and forecast uncertainty.
-    round_trip_cost_pct = 2 * (fee_bps + slippage_bps) / 10_000
-    edge = abs(prob_up - 0.5)
-    # This is a transparent signal threshold, not an expected-return model.
-    threshold = max(0.08, round_trip_cost_pct * 2)
-    if prob_up >= 0.5 + threshold:
-        return "PAPER LONG", round_trip_cost_pct
-    if prob_up <= 0.5 - threshold:
-        return "PAPER SHORT / AVOID LONG", round_trip_cost_pct
-    return "NO TRADE", round_trip_cost_pct
+        raise ValueError("Latest candle lacks enough indicator history.")
+    model = new_model()
+    model.fit(X, y)
+    p_up = float(model.predict_proba(latest_features)[0, 1])
+    metrics, predictions, trades = walk_forward_validate(df, horizon_bars, fee_bps, slippage_bps, min_train, folds)
+    return p_up, float(df["close"].iloc[-1]), metrics, predictions, trades
 
 if "results" not in st.session_state:
     st.session_state.results = None
 
 if refresh or st.session_state.results is None:
-    results = {}
-    errors = {}
-    with st.spinner("Fetching candles and running chronological holdout evaluations…"):
+    results, errors = {}, {}
+    with st.spinner("Fetching candles and running purged walk-forward tests…"):
         for name, cfg in HORIZONS.items():
             try:
                 df = fetch_ohlcv(exchange_id, symbol, cfg["timeframe"], candle_limit)
-                p_up, price, metrics, X, y, model, feats = evaluate_and_forecast(df, cfg["bars"])
-                signal, cost = paper_signal(p_up, fee_bps, slippage_bps)
+                p_up, price, metrics, predictions, trades = evaluate_and_forecast(
+                    df, cfg["bars"], fee_bps, slippage_bps, min_train, folds
+                )
+                cost = 2 * (fee_bps + slippage_bps) / 10000
+                threshold = max(0.08, cost * 2)
+                signal = "PAPER LONG" if p_up >= 0.5 + threshold else ("PAPER SHORT / AVOID LONG" if p_up <= 0.5 - threshold else "NO TRADE")
                 results[name] = {
                     "df": df, "p_up": p_up, "price": price, "metrics": metrics,
-                    "signal": signal, "cost": cost, "timeframe": cfg["timeframe"],
-                    "bars": cfg["bars"]
+                    "predictions": predictions, "trades": trades, "signal": signal,
+                    "timeframe": cfg["timeframe"], "bars": cfg["bars"]
                 }
             except Exception as e:
-                errors[name] = str(e)
+                errors[name] = f"{type(e).__name__}: {e}"
     st.session_state.results = {"results": results, "errors": errors, "timestamp": datetime.now(timezone.utc).isoformat()}
 data = st.session_state.results
-results = data["results"]
-errors = data["errors"]
+results, errors = data["results"], data["errors"]
 
 if not results:
-    st.error("No horizon produced a valid forecast. Check the exchange, symbol, network, and available history.")
+    st.error("No horizon produced a valid forecast. Check exchange, symbol, network, and history.")
 else:
-    latest = next(iter(results.values()))
+    first = next(iter(results.values()))
     c1, c2, c3 = st.columns(3)
-    c1.metric("Latest reference price", f"{latest['price']:,.2f}")
+    c1.metric("Latest reference price", f"{first['price']:,.2f}")
     c2.metric("Exchange / market", f"{exchange_id} · {symbol}")
     c3.metric("Last refresh (UTC)", data["timestamp"][:19].replace("T", " "))
-    st.info("Forecast probabilities are model outputs, not guarantees. Holdout metrics below are historical diagnostics, not evidence of future profitability.")
+    st.info("Research only. Forecast probabilities are not guarantees. Walk-forward results are historical diagnostics, not proof of future profitability.")
     cards = st.columns(4)
     for i, (name, r) in enumerate(results.items()):
         with cards[i]:
@@ -161,69 +242,44 @@ else:
             st.metric("Probability of up move", f"{r['p_up']:.1%}")
             st.metric("Probability of down / flat", f"{1-r['p_up']:.1%}")
             st.write(f"**Paper signal:** {r['signal']}")
-            st.caption(f"Training model: logistic regression • {r['timeframe']} candles • target {r['bars']} bars")
-    st.subheader("Paper-trading ledger")
-    st.caption("These are simulated positions only. No exchange orders are sent. Positions live in this browser session and reset when the session is lost.")
-    if "paper_ledger" not in st.session_state:
-        st.session_state.paper_ledger = []
-    trade_cols = st.columns(4)
-    for i, (name, r) in enumerate(results.items()):
-        with trade_cols[i]:
-            side = 1 if r["signal"] == "PAPER LONG" else (-1 if r["signal"] == "PAPER SHORT / AVOID LONG" else 0)
-            label = "Simulate long" if side == 1 else ("Simulate short" if side == -1 else "No trade signal")
-            if st.button(label, key=f"paper_{name}", disabled=(side == 0)):
-                st.session_state.paper_ledger.append({
-                    "opened_utc": datetime.now(timezone.utc).isoformat(),
-                    "horizon": name,
-                    "side": side,
-                    "entry_price": float(r["price"]),
-                    "fee_bps_each_side": float(fee_bps),
-                    "slippage_bps_each_side": float(slippage_bps),
-                })
-    if st.session_state.paper_ledger:
-        ledger_rows = []
-        current_price = float(latest["price"])
-        for pos in st.session_state.paper_ledger:
-            side = int(pos["side"])
-            gross = side * (current_price / pos["entry_price"] - 1)
-            costs = 2 * (pos["fee_bps_each_side"] + pos["slippage_bps_each_side"]) / 10000
-            net = gross - costs
-            ledger_rows.append({
-                "Opened (UTC)": pos["opened_utc"][:19].replace("T", " "),
-                "Horizon": pos["horizon"],
-                "Side": "Long" if side == 1 else "Short",
-                "Entry": pos["entry_price"],
-                "Latest reference": current_price,
-                "Gross P&L %": f"{gross:.3%}",
-                "Estimated net P&L %": f"{net:.3%}",
-                "Cost assumption (round trip)": f"{costs:.3%}",
-            })
-        st.dataframe(pd.DataFrame(ledger_rows), use_container_width=True, hide_index=True)
-        if st.button("Clear paper ledger"):
-            st.session_state.paper_ledger = []
-            st.rerun()
-    else:
-        st.write("No simulated positions yet. Choose a simulated long/short button when a signal is available.")
+            st.caption(f"Logistic regression • {r['timeframe']} candles • target {r['bars']} bars")
 
-    st.subheader("Chronological holdout validation")
+    st.subheader("Purged walk-forward validation vs baselines")
     rows = []
     for name, r in results.items():
         m = r["metrics"]
         rows.append({
-            "Horizon": name,
-            "Holdout rows": m["test_rows"],
-            "Accuracy": f"{m['accuracy']:.1%}",
-            "Balanced accuracy": f"{m['balanced_accuracy']:.1%}",
-            "Brier score (lower better)": f"{m['brier']:.4f}",
-            "Holdout up-rate": f"{m['base_rate']:.1%}",
-            "Test start (UTC)": m["test_start"],
-            "Test end (UTC)": m["test_end"],
+            "Horizon": name, "Predictions": m["predictions"], "Folds": m["folds_used"],
+            "Model accuracy": f"{m['model_accuracy']:.1%}",
+            "Majority baseline accuracy": f"{m['majority_accuracy']:.1%}",
+            "Model balanced accuracy": f"{m['model_balanced_accuracy']:.1%}",
+            "Majority balanced accuracy": f"{m['majority_balanced_accuracy']:.1%}",
+            "Model Brier ↓": f"{m['model_brier']:.4f}",
+            "Historical-rate Brier ↓": f"{m['historical_rate_brier']:.4f}",
+            "Test up-rate": f"{m['test_up_rate']:.1%}"
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    st.caption("Holdout uses the latest 20% of labelled observations in a chronological split. Overlapping forward-return labels can make adjacent test rows dependent; treat these metrics as preliminary. A stronger evaluation should use purged/embargoed walk-forward folds and compare to baselines.")
+    st.caption("Each fold trains only on earlier rows. Training labels whose forward horizon overlaps the test start are purged. Baselines are calculated using information available from the training fold.")
+    st.subheader("Trading-cost-aware paper strategy")
+    cost_rows = []
+    for name, r in results.items():
+        m = r["metrics"]
+        cost_rows.append({
+            "Horizon": name, "Non-overlapping trades": m["trades"],
+            "Win rate after costs": "—" if np.isnan(m["win_rate"]) else f"{m['win_rate']:.1%}",
+            "Compounded net return": f"{m['net_compounded_return']:.2%}",
+            "Mean net return / trade": "—" if np.isnan(m["net_mean_trade_return"]) else f"{m['net_mean_trade_return']:.3%}",
+            "Max drawdown": "—" if np.isnan(m["max_drawdown"]) else f"{m['max_drawdown']:.2%}",
+            "Round-trip cost": f"{m['cost_round_trip_pct']:.3f}%"
+        })
+    st.dataframe(pd.DataFrame(cost_rows), use_container_width=True, hide_index=True)
+    st.warning("Backtest is a simplified research simulation using close-to-close forward returns, fixed thresholds and assumed costs. It excludes spread dynamics, funding, market impact, latency, partial fills and taxes. Do not use it as a profitability claim.")
+    st.subheader("Fold predictions")
+    chosen = st.selectbox("Show prediction rows for", list(results.keys()))
+    st.dataframe(results[chosen]["predictions"].tail(100), use_container_width=True, hide_index=True)
     st.subheader("Price history")
-    chosen = st.selectbox("Chart horizon / candle interval", list(results.keys()))
-    df = results[chosen]["df"]
+    chosen_chart = st.selectbox("Chart horizon / candle interval", list(results.keys()))
+    df = results[chosen_chart]["df"]
     fig = go.Figure(data=[go.Candlestick(x=df["timestamp"], open=df["open"], high=df["high"], low=df["low"], close=df["close"], name="BTC")])
     fig.update_layout(height=420, xaxis_title="UTC time", yaxis_title="Price", xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, use_container_width=True)
@@ -232,11 +288,11 @@ else:
     a.metric("Assumed round-trip cost", f"{2*(fee_bps+slippage_bps)/100:.3f}%")
     b.metric("Execution mode", "SIMULATION ONLY")
     c.metric("Live orders", "DISABLED")
-    st.write("The initial build emits paper signals only; it does not submit or persist simulated fills. Do not interpret a probability threshold as a proven trading edge.")
+
 if errors:
-    with st.expander("Data / model warnings"):
+    with st.expander("Data / model warnings", expanded=True):
         for name, err in errors.items():
             st.warning(f"{name}: {err}")
 
 st.divider()
-st.caption("Data: public exchange OHLCV via CCXT. Only closed candles are used. No exchange keys are requested. Not financial advice.")
+st.caption("Data: public exchange OHLCV via CCXT. Closed candles only. No exchange keys or live orders. Research, not financial advice.")

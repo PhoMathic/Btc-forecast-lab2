@@ -1,71 +1,45 @@
-# BTC Forecast Lab
+# BTC Forecast Lab — Walk-forward upgrade
 
-A dashboard-first Bitcoin forecasting research starter. It fetches public OHLCV candles through CCXT and evaluates a transparent logistic-regression baseline at four horizons:
+This version integrates purged expanding-window walk-forward validation, baseline comparisons, and a simplified cost-aware paper strategy into the Streamlit dashboard.
 
-- 15 minutes using 1-minute candles
-- 4 hours using 5-minute candles
-- 24 hours using 15-minute candles
-- 7 days using 1-hour candles
+## Deploy on Streamlit Community Cloud
 
-**Paper/research only.** This project does not submit exchange orders and does not request API keys. No accuracy or profitability is claimed.
+Replace the existing `app.py` in your GitHub repository with this version. Keep `requirements.txt` unchanged. `validation.py` is included as a separate reusable CSV validation script.
 
-## Run locally
+- Exchange default: Kraken
+- Market default: BTC/USD
+- Candle count default: 1,000 per horizon
+- Fees/slippage are editable assumptions, not fetched from your account.
+- No exchange credentials or live orders are used.
 
-Python 3.10+ recommended.
+## What the dashboard adds
 
-```bash
-python -m venv .venv
-# Windows: .venv\Scripts\activate
-# macOS/Linux:
-source .venv/bin/activate
-pip install -r requirements.txt
-streamlit run app.py
-```
+- Chronological expanding-window test blocks.
+- Purging: training rows whose forward-return label overlaps the start of a test block are excluded.
+- Model accuracy and balanced accuracy compared with a training-fold majority baseline.
+- Brier score compared with a training-fold historical-rate probability baseline.
+- Fixed probability thresholds (>= 0.58 long, <= 0.42 short) for a research-only paper strategy.
+- Estimated round-trip fees and slippage.
+- Non-overlapping trades by horizon, compounded net return, win rate, and maximum drawdown.
+- Prediction rows for review.
 
-Choose an exchange and symbol in the sidebar, then select **Fetch market data & evaluate**. Public market data availability and symbol conventions differ by exchange.
+## Limitations
 
-## What is implemented
+This is a research prototype, not evidence of a profitable strategy. Backtest returns use close-to-close forward returns and simplified costs. It does not model spread variation, funding, borrow costs, market impact, latency, partial fills, taxes, or operational outages. Results can be unstable with small samples. Compare against baselines and validate across more data and market regimes before relying on signals.
 
-- Public OHLCV ingestion via CCXT, with rate limiting enabled
-- Exclusion of the newest potentially incomplete candle
-- Features: returns, rolling volatility, EMA gap, SMA gap, RSI-like momentum, volume change
-- Separate model for each horizon
-- Chronological 80/20 holdout diagnostics: accuracy, balanced accuracy, Brier score, holdout up-rate
-- Assumed trading fees and slippage shown transparently
-- Rule-based paper signal / no-trade band; no order execution
+## Android deployment
 
-## Important limitations
+1. Download and extract the ZIP.
+2. In GitHub, open `btc-forecast-lab` and open `app.py`.
+3. Use the file edit menu if available, or choose Add file → Upload files to upload the replacement `app.py` from this bundle. If uploading with the same name, GitHub will prompt you to replace/commit the changed file.
+4. Commit the change to `main`.
+5. Streamlit Community Cloud should redeploy after the commit. If not, open Manage app and reboot/redeploy.
+6. Open the app, leave Kraken / BTC/USD selected, then tap Fetch market data & evaluate.
+7. Read the **Purged walk-forward validation vs baselines** and **Trading-cost-aware paper strategy** tables.
 
-1. The dashboard's first evaluation is a chronological holdout, not a complete walk-forward study. The `validation.py` script adds expanding-window walk-forward evaluation and purges training observations whose forward-return labels overlap the test fold.
-2. A 0.5 probability threshold is not automatically a trading edge. Probabilities are not yet calibrated, and the model is a baseline.
-3. Holdout rows have overlapping forward-return labels; adjacent observations are not independent.
-4. Simulated strategy returns in `validation.py` assume a simplified close-to-close fill, a fixed cost per round trip, and a conservative probability threshold. This does not model spread dynamics, latency, partial fills, funding, market impact, or stop-loss path.
-5. Exchange candles may be incomplete, missing, revised, or rate-limited. Preserve raw downloads and record exchange/symbol/timeframe/timestamp for any serious study.
-6. Historical performance does not guarantee future performance.
+## Standalone CSV validator
 
-## Reproducible walk-forward validation
+`validation.py` expects a CSV with `timestamp,open,high,low,close,volume`. Example:
+`python validation.py candles.csv --horizon 15 --min-train 300 --test-size 100 --fee-bps 10 --slippage-bps 5`
 
-Export OHLCV data with columns `timestamp,open,high,low,close,volume` to CSV. Then run, for example:
-
-```bash
-python validation.py btc_1m.csv --horizon 15 --min-train 300 --test-size 100 --fee-bps 10 --slippage-bps 5 --out predictions.csv
-```
-
-`--horizon` is measured in rows, not clock time. Use a CSV whose candle interval matches the intended horizon. The script writes one row per out-of-sample forecast and prints summary metrics. Keep a copy of the source CSV, its date range, exchange, and command line to reproduce results.
-
-## Validation protocol before trusting a signal
-
-- Compare to majority-class and zero-return/no-trade baselines.
-- Evaluate separate market regimes and multiple time periods.
-- Use purged expanding-window walk-forward folds; consider an embargo at least as long as the forecast horizon.
-- Report Brier score and reliability/calibration bins, not accuracy alone.
-- Account for fees, bid/ask spread, slippage, latency and funding where applicable.
-- Track every live-time forecast before the outcome is known.
-- Run paper trading for a meaningful period before considering any real-money use.
-- Do not tune repeatedly against the final holdout.
-
-## Data and validation resources
-
-- CCXT OHLCV manual: https://github.com/ccxt/ccxt/wiki/Manual
-- Freqtrade lookahead-bias guidance: https://www.freqtrade.io/en/stable/lookahead-analysis/
-- scikit-learn metrics: https://scikit-learn.org/stable/modules/model_evaluation.html
+Note: `--horizon` is in candle rows, so use the matching candle interval for the chosen forecast horizon.
